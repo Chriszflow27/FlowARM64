@@ -61,10 +61,8 @@ await SendDiscordNotificationAsync("✅ Bot iniciado correctamente en la Tanix W
 var keyDropService = host.Services.GetRequiredService<IKeyDropService>();
 var sessionService = host.Services.GetRequiredService<ISessionService>();
 
-// Inicializar sesión Playwright
 await sessionService.SetKeyDropCookieAsync();
 
-// 🚀 Memoria del bot: Aquí guardamos los IDs que ya procesamos, ignoramos o fallamos.
 var joinedGiveaways = new HashSet<string>();
 
 while (true)
@@ -73,7 +71,9 @@ while (true)
     {
         Log.Information("--- Buscando sorteos activos ---");
         var giveaways = await keyDropService.GetGiveawaysAsync();
-        bool attemptedNewJoin = false; // Bandera para saber si trabajamos o descansamos
+
+        // ✅ La bandera solo se activa si nos unimos con éxito
+        bool attemptedNewJoin = false;
 
         if (giveaways == null || giveaways.Count == 0)
         {
@@ -83,7 +83,7 @@ while (true)
         {
             foreach (var giveaway in giveaways)
             {
-                // Si el sorteo ya está en nuestra lista de omitidos/unidos, lo saltamos rápidamente
+                // Salto rápido: ya procesado en un ciclo anterior
                 if (joinedGiveaways.Contains(giveaway.Id))
                 {
                     Log.Debug("Sorteo {Id} omitido, ya estamos en la lista local de unidos/ignorados.", giveaway.Id);
@@ -94,45 +94,85 @@ while (true)
 
                 var details = await keyDropService.GetGiveawayDetailsByIdAsync(giveaway.Id);
 
-                if (details != null && details.Status != "ended")
+                if (details == null || details.Status == "ended")
                 {
-                    // 🔑 Filtro de Torneos: Solo Amateur y Contender
-                    if (details.TournamentType != "amateur" && details.TournamentType != "contender")
-                    {
-                        Log.Information("⏭️ Sorteo {GiveawayId} omitido (Tipo: {TournamentType}). Ignorando permanentemente.", giveaway.Id, details.TournamentType);
-                        joinedGiveaways.Add(giveaway.Id);
-                        continue; // Pasamos al siguiente sorteo
-                    }
+                    // Si no hay detalles o ya terminó, lo ignoramos permanentemente
+                    joinedGiveaways.Add(giveaway.Id);
+                    continue;
+                }
 
-                    // Si llegamos aquí, es válido y vamos a intentar unirnos
-                    attemptedNewJoin = true; 
-                    var joinResponse = await keyDropService.JoinGiveawayAsync(giveaway.Id);
+                bool isAmateur   = string.Equals(details.TournamentType, "amateur",   StringComparison.OrdinalIgnoreCase);
+                bool isContender = string.Equals(details.TournamentType, "contender", StringComparison.OrdinalIgnoreCase);
 
-                    if (joinResponse != null && joinResponse.Success)
+                // ── Filtro 1: Tipos no deseados (champion, challenger, etc.) ──
+                if (!isAmateur && !isContender)
+                {
+                    Log.Information("⏭️ Sorteo {Id} omitido (Tipo: {Type}). Ignorando permanentemente.",
+                        giveaway.Id, details.TournamentType);
+                    joinedGiveaways.Add(giveaway.Id);
+                    continue;
+                }
+
+                // ── Filtro 2: Amateur solo si el premio supera $4.50 ──
+                if (isAmateur)
+                {
+                    double prize = details.PrizePrice ?? 0;
+                    if (prize <= 4.5)
                     {
-                        Log.Information("✅ Te uniste al sorteo {Id}", giveaway.Id);
-                        await SendDiscordNotificationAsync($"🎉 Te uniste al sorteo {giveaway.Id} ({details.Title})");
+                        Log.Information("⏭️ Amateur {Id} omitido. Premio ({Prize:F2} USD) no supera $4.50.",
+                            giveaway.Id, prize);
                         joinedGiveaways.Add(giveaway.Id);
+                        continue;
                     }
-                    else
-                    {
-                        Log.Warning("❌ No se pudo unir al sorteo {Id}. Lo añadimos a la lista para no hacer bucle infinito.", giveaway.Id);
-                        joinedGiveaways.Add(giveaway.Id);
-                    }
+                }
+
+                // ── Filtro 3: La API ya nos marca como unidos ──
+                if (details.Joined == true)
+                {
+                    Log.Information("✅ Ya unidos al sorteo {Id} (confirmado por API). Omitiendo clic.",
+                        giveaway.Id);
+                    joinedGiveaways.Add(giveaway.Id);
+                    continue;
+                }
+
+                // ── Intentar unirse ──
+                Log.Information("🎯 Intentando unirse: {Id} | Tipo: {Type} | Premio: {Prize:F2} USD",
+                    giveaway.Id, details.TournamentType, details.PrizePrice ?? 0);
+
+                var joinResponse = await keyDropService.JoinGiveawayAsync(giveaway.Id);
+
+                // Siempre se añade a la lista tras el intento (evita bucle infinito)
+                joinedGiveaways.Add(giveaway.Id);
+
+                if (joinResponse != null && joinResponse.Success)
+                {
+                    Log.Information("✅ Te uniste al sorteo {Id}", giveaway.Id);
+                    await SendDiscordNotificationAsync(
+                        $"🎉 Unido a {giveaway.Id} | {details.Title} | {details.PrizePrice:F2} USD");
+
+                    // ✅ SOLO aquí activamos la bandera → dispara el descanso de 90s
+                    attemptedNewJoin = true;
+                }
+                else
+                {
+                    // ❌ Falló (Contender sin depósito, límite, etc.)
+                    // → NO se activa attemptedNewJoin → el bucle continúa con el siguiente sorteo
+                    Log.Warning("❌ No se pudo unir al sorteo {Id} ({Type}). Continuando con el siguiente...",
+                        giveaway.Id, details.TournamentType);
                 }
             }
         }
 
-        // ⏱️ LÓGICA DE TIEMPOS INTELIGENTE
+        // ── Lógica de tiempos inteligente ──
         if (!attemptedNewJoin)
         {
-            Log.Information("💤 No hay sorteos nuevos para unirse. Esperando 1 minuto y 30 segundos...");
-            await Task.Delay(90000); // 90 segundos
+            Log.Information("💤 Sin sorteos nuevos. Esperando 1 minuto y 30 segundos...");
+            await Task.Delay(90000);
         }
         else
         {
-            Log.Information("⏱️ Esperando 10 segundos antes del siguiente escaneo rápido...");
-            await Task.Delay(10000); // 10 segundos
+            Log.Information("⏱️ Unión exitosa. Esperando 10 segundos antes del siguiente escaneo...");
+            await Task.Delay(10000);
         }
     }
     catch (Exception ex)
