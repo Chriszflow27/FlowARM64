@@ -28,9 +28,6 @@ public class KeyDropService : IKeyDropService
         return Task.FromResult<PageConfigResponse?>(null);
     }
 
-    // ---------------------------
-    // 1. OBTENER IDS (DOM SCRAPING CON JSON)
-    // ---------------------------
     public async Task<List<Giveaway>?> GetGiveawaysAsync()
     {
         try
@@ -78,7 +75,7 @@ public class KeyDropService : IKeyDropService
 
             if (string.IsNullOrWhiteSpace(rawJson))
             {
-                Log.Warning("GetGiveawaysAsync: Definitivamente no hay tarjetas en la pantalla.");
+                Log.Warning("GetGiveawaysAsync: No hay tarjetas en pantalla.");
                 return null;
             }
 
@@ -86,7 +83,7 @@ public class KeyDropService : IKeyDropService
 
             if (giveaways == null || giveaways.Count == 0)
             {
-                Log.Warning("GetGiveawaysAsync: No se encontraron sorteos tras deserializar.");
+                Log.Warning("GetGiveawaysAsync: No se encontraron sorteos.");
                 return null;
             }
 
@@ -94,9 +91,7 @@ public class KeyDropService : IKeyDropService
 
             Log.Information("✅ Se encontraron {Count} sorteos oficiales de KeyDrop.", officialGiveaways.Count);
             foreach (var g in officialGiveaways)
-            {
                 Log.Information("Sorteo oficial detectado: {Id}", g.Id);
-            }
 
             return officialGiveaways;
         }
@@ -107,9 +102,6 @@ public class KeyDropService : IKeyDropService
         }
     }
 
-    // ---------------------------
-    // 2. DETALLES DEL SORTEO
-    // ---------------------------
     public async Task<GiveawayDetails?> GetGiveawayDetailsByIdAsync(string giveawayId)
     {
         try
@@ -117,7 +109,7 @@ public class KeyDropService : IKeyDropService
             var host = _configuration["GiveawayJoinHost"];
             if (string.IsNullOrEmpty(host))
             {
-                host = _configuration["GiveawayListHost"]; 
+                host = _configuration["GiveawayListHost"];
                 if (string.IsNullOrEmpty(host)) return null;
             }
 
@@ -159,9 +151,6 @@ public class KeyDropService : IKeyDropService
         }
     }
 
-    // ---------------------------
-    // 3. UNIRSE AL SORTEO (DOBLE VALIDACIÓN ESTRICTA)
-    // ---------------------------
     public async Task<JoinGiveawayResponse?> JoinGiveawayAsync(string giveawayId)
     {
         try
@@ -183,7 +172,7 @@ public class KeyDropService : IKeyDropService
                 await page.WaitForSelectorAsync(buttonSelector, new Microsoft.Playwright.PageWaitForSelectorOptions
                 {
                     State = Microsoft.Playwright.WaitForSelectorState.Attached,
-                    Timeout = 15000 
+                    Timeout = 15000
                 });
             }
             catch
@@ -202,15 +191,15 @@ public class KeyDropService : IKeyDropService
                 await page.EvaluateAsync("el => el.click()", joinButton);
                 Log.Information("🖱️ Click físico ejecutado en {GiveawayId}.", giveawayId);
 
-                // --- VALIDACIÓN 1: LA VENTANA EMERGENTE (TOAST) ---
+                // --- VALIDACIÓN 1: TOAST ---
                 try
                 {
                     Log.Information("⏳ Buscando notificación emergente verde de éxito...");
                     var toastSelector = "[data-testid='toast-message-title']";
-                    
-                    var toast = await page.WaitForSelectorAsync(toastSelector, new Microsoft.Playwright.PageWaitForSelectorOptions { 
-                        State = Microsoft.Playwright.WaitForSelectorState.Visible, 
-                        Timeout = 5000 // Esperamos 5 segundos para que aparezca
+                    var toast = await page.WaitForSelectorAsync(toastSelector, new Microsoft.Playwright.PageWaitForSelectorOptions
+                    {
+                        State = Microsoft.Playwright.WaitForSelectorState.Visible,
+                        Timeout = 5000
                     });
 
                     if (toast != null)
@@ -228,32 +217,41 @@ public class KeyDropService : IKeyDropService
                     Log.Information("⚠️ La notificación emergente no apareció. Verificando contador de entradas...");
                 }
 
-                // --- VALIDACIÓN 2: EL CONTADOR DE ENTRADAS ---
-                await Task.Delay(1500); // Pequeña pausa extra para que el DOM se actualice bien
-                
-                var entriesElement = await page.QuerySelectorAsync("p:has-text('Entradas:'), p:has-text('Entries:')");
-                if (entriesElement != null)
-                {
-                    var text = await entriesElement.InnerTextAsync();
-                    if (text.Contains("1"))
-                    {
-                        Log.Information("✅ ¡Confirmado! Las entradas cambiaron de 0 a 1 en {GiveawayId}", giveawayId);
-                        return new JoinGiveawayResponse { Success = true };
-                    }
-                    else
-                    {
-                        // 🛑 AQUÍ SE EVITA EL FALSO POSITIVO: Retornamos NULL, lo que significa FALLO.
-                        Log.Warning("❌ Hicimos click, pero las entradas siguen en 0: '{Text}'. Falta de nivel, fondos o límite alcanzado.", text.Trim());
-                        return null; 
-                    }
-                }
+                // --- VALIDACIÓN 2: CONTADOR DE ENTRADAS (fix: span en lugar de p) ---
+                await Task.Delay(1500);
 
-                // Si no vio ni el Toast ni las entradas, es un fallo. Se acabó el asumir que funcionó.
-                Log.Warning("❌ No se pudo validar la unión visualmente. Se asume fallo.");
-                return null; 
+                // El HTML real usa <span><strong>1</strong></span>, no <p>.
+                // EvaluateAsync es más fiable que QuerySelectorAsync con :has-text.
+                var entriesCount = await page.EvaluateAsync<int>(@"
+                    () => {
+                        const spans = Array.from(document.querySelectorAll('span'));
+                        const target = spans.find(s =>
+                            s.textContent.includes('Entradas:') || s.textContent.includes('Entries:')
+                        );
+                        if (!target) return -1;
+                        const strong = target.querySelector('strong');
+                        return strong ? (parseInt(strong.textContent.trim()) || 0) : -1;
+                    }
+                ");
+
+                if (entriesCount > 0)
+                {
+                    Log.Information("✅ ¡Confirmado! Entradas: {Count} en {GiveawayId}", entriesCount, giveawayId);
+                    return new JoinGiveawayResponse { Success = true };
+                }
+                else if (entriesCount == 0)
+                {
+                    Log.Warning("❌ Entradas siguen en 0 en {GiveawayId}. Falta nivel, fondos o límite.", giveawayId);
+                    return null;
+                }
+                else
+                {
+                    Log.Warning("❌ No se encontró el contador de entradas en {GiveawayId}. Se asume fallo.", giveawayId);
+                    return null;
+                }
             }
 
-            Log.Warning("❌ Definitivamente no se encontró ningún botón de unirse en {GiveawayId}.", giveawayId);
+            Log.Warning("❌ No se encontró ningún botón de unirse en {GiveawayId}.", giveawayId);
             return null;
         }
         catch (Exception ex)
